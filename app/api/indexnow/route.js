@@ -1,74 +1,82 @@
-export const runtime = 'nodejs';
+const DEFAULT_ALLOWED_IPS = ['92.65.51.76'];
 
-const INDEXNOW_ENDPOINT = 'https://api.indexnow.org/IndexNow';
-const MAX_URLS = 10000;
+function getAllowedIps() {
+  return (process.env.ALLOWED_IPS || DEFAULT_ALLOWED_IPS.join(','))
+    .split(',')
+    .map((ip) => ip.trim())
+    .filter(Boolean);
+}
 
-function isHttpUrl(value) {
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  } catch {
-    return false;
-  }
+function normalizeIp(ip) {
+  if (!ip) return '';
+  return ip
+    .replace(/^::ffff:/, '')
+    .replace(/^\[|\]$/g, '')
+    .trim();
+}
+
+function getClientIp(request) {
+  const forwardedFor = request.headers.get('x-forwarded-for');
+  const firstForwardedIp = forwardedFor?.split(',')[0]?.trim();
+
+  return normalizeIp(
+    firstForwardedIp ||
+    request.headers.get('x-real-ip') ||
+    request.headers.get('cf-connecting-ip') ||
+    ''
+  );
+}
+
+function isAllowedIp(request) {
+  return getAllowedIps().includes(getClientIp(request));
 }
 
 function validatePayload(payload) {
-  const errors = [];
+  if (!payload || typeof payload !== 'object') return 'Payload ontbreekt.';
+  if (!payload.host || typeof payload.host !== 'string') return 'host ontbreekt.';
+  if (!payload.key || typeof payload.key !== 'string') return 'key ontbreekt.';
+  if (!Array.isArray(payload.urlList) || payload.urlList.length === 0) return 'urlList ontbreekt.';
+  if (payload.urlList.length > 10000) return 'urlList mag maximaal 10.000 URLs bevatten.';
 
-  if (!payload || typeof payload !== 'object') {
-    return ['Payload ontbreekt of is geen JSON-object.'];
-  }
-
-  if (!payload.host || typeof payload.host !== 'string') {
-    errors.push('host is verplicht.');
-  }
-
-  if (!payload.key || typeof payload.key !== 'string') {
-    errors.push('key is verplicht.');
-  }
-
-  if (!Array.isArray(payload.urlList) || payload.urlList.length === 0) {
-    errors.push('urlList moet minimaal één URL bevatten.');
-  }
-
-  if (Array.isArray(payload.urlList) && payload.urlList.length > MAX_URLS) {
-    errors.push(`urlList mag maximaal ${MAX_URLS} URLs bevatten.`);
-  }
-
-  if (Array.isArray(payload.urlList)) {
-    const invalidUrls = payload.urlList.filter((url) => typeof url !== 'string' || !isHttpUrl(url));
-    if (invalidUrls.length) {
-      errors.push('urlList bevat ongeldige HTTP(S)-URLs.');
+  for (const url of payload.urlList) {
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol)) return `${url} is geen HTTP(S)-URL.`;
+      if (parsed.host !== payload.host) return `${url} hoort niet bij host ${payload.host}.`;
+    } catch {
+      return `${url} is geen geldige URL.`;
     }
   }
 
-  if (payload.keyLocation && !isHttpUrl(payload.keyLocation)) {
-    errors.push('keyLocation moet een geldige HTTP(S)-URL zijn.');
-  }
-
-  return errors;
+  return null;
 }
 
 export async function POST(request) {
+  if (!isAllowedIp(request)) {
+    return Response.json(
+      { error: 'Forbidden: IP not allowed.' },
+      { status: 403, headers: { 'Cache-Control': 'no-store' } }
+    );
+  }
+
   try {
     const payload = await request.json();
-    const errors = validatePayload(payload);
+    const validationError = validatePayload(payload);
 
-    if (errors.length) {
-      return Response.json({ errors }, { status: 400 });
+    if (validationError) {
+      return Response.json({ error: validationError }, { status: 400 });
     }
 
-    const response = await fetch(INDEXNOW_ENDPOINT, {
+    const response = await fetch('https://api.indexnow.org/IndexNow', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-      },
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
       body: JSON.stringify({
         host: payload.host,
         key: payload.key,
         ...(payload.keyLocation ? { keyLocation: payload.keyLocation } : {}),
         urlList: payload.urlList,
       }),
+      cache: 'no-store',
     });
 
     const text = await response.text();
@@ -90,7 +98,7 @@ export async function POST(request) {
 
 export async function GET() {
   return Response.json(
-    { ok: true, message: 'IndexNow proxy is actief. Gebruik POST om URLs te versturen.' },
-    { status: 200 }
+    { error: 'Method Not Allowed. Use POST.' },
+    { status: 405, headers: { Allow: 'POST' } }
   );
 }
